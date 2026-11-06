@@ -9,8 +9,10 @@ from pwdlib import PasswordHash
 import jwt
 from datetime import datetime,timedelta,timezone
 from fastapi.security import OAuth2PasswordBearer
+from rag.rag_routes import router as rag_router
 
 app = FastAPI()
+app.include_router(rag_router)
 password_hash=PasswordHash.recommended()
 env = dotenv_values(".env")
 SECRET_KEY=env.get("SECRET_KEY")
