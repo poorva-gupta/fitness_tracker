@@ -1,16 +1,27 @@
 
+import math
+import razorpay
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from dotenv import dotenv_values
-from schemas import UserCreate, UserProfileCreate,WorkoutCreate,WorkoutUpdate,DietCreate,Dietupdate,Login,InstructorCreate,InstructorResponse,InstructorUpdate
+from schemas import BookingResponse, UserCreate, UserProfileCreate,WorkoutCreate,WorkoutUpdate,DietCreate,DietUpdate,Login,InstructorCreate,InstructorResponse,InstructorUpdate,PaymentVerification
 from database import Config, get_db
-from models import User, User_profile, Workout,Diet,Instructor
+from models import Booking, User, User_profile, Workout,Diet,Instructor,Payment
 from pwdlib import PasswordHash
 import jwt
 from datetime import datetime,timedelta,timezone
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from rag.rag_routes import router as rag_router
-
+from fastapi.responses import FileResponse
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+RAZOR_APIKEY = os.getenv("RAZOR_APIKEY")
+RAZOR_SECRET = os.getenv("RAZOR_SECRET")
+print("Key ID loaded:", bool(RAZOR_APIKEY))
+print("Secret loaded:", bool(RAZOR_SECRET))
+print("Key mode:", RAZOR_APIKEY[:8] if RAZOR_APIKEY else "Missing")
+Client=razorpay.Client(auth=(RAZOR_APIKEY,RAZOR_SECRET))
 app = FastAPI()
 app.include_router(rag_router)
 password_hash=PasswordHash.recommended()
@@ -21,7 +32,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=int(env.get("ACCESS_TOKEN_EXPIRE_MINUTES","30"))
 db_config = Config(env)
 app.state.db_config = db_config
 db_config.set_up()
-oauth2_scheme=OAuth2PasswordBearer(tokenUrl='login')
+oauth2_scheme = HTTPBearer()
 
 def create_access_token(user_id:int):
     expire=datetime.now(timezone.utc)+timedelta(
@@ -53,7 +64,8 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
         name=user.name,
         age=user.age,
         email=user.email,
-        password=password_hash.hash(user.password)
+        password=password_hash.hash(user.password),
+        role="user"
     )
 
     db.add(new_user)
@@ -63,9 +75,11 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
+    token = credentials.credentials
+
     try:
         payload = jwt.decode(
             token,
@@ -104,10 +118,17 @@ def get_current_admin(
         return current_user
 
        
-
-
+@app.get("/payment")
+def payment_page():
+    file_path = os.path.join(os.path.dirname(__file__), "payment.html")
+    return FileResponse(file_path)
 @app.post("/user_profile")
-def create_user_profile(profile:UserProfileCreate,db:Session=Depends(get_db)):
+def create_user_profile(profile:UserProfileCreate,db:Session=Depends(get_db),current_user: User = Depends(get_current_user)):
+    if profile.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot create another user's profile"
+    )
     existing_user=db.query(User).filter(User.id==profile.user_id).first()
     if not existing_user:
         raise HTTPException(
@@ -191,7 +212,16 @@ def update_user_profile(
     return {"message": "user profile updated successfully"}
 
 @app.delete("/user_profile/{user_id}")
-def delete_user_profile(user_id:int,db:Session=Depends(get_db)):
+def delete_user_profile(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot delete another user's profile"
+        )
     user=db.query(User).filter(User.id==user_id).first()
     if not user:
         raise HTTPException(
@@ -513,15 +543,42 @@ def create_instructor(
     db:Session=Depends(get_db),
     current_admin:User=Depends(get_current_admin)
 ):
+    existing_user = db.query(User).filter(User.email == instructor_data.email).first()
+    if existing_user:
+        raise HTTPException(
+        status_code=409,
+        detail="Email already exists"
+    )
+    new_user=User(
+            name=instructor_data.name,
+            age=instructor_data.age,
+            email=instructor_data.email,
+            password=password_hash.hash(instructor_data.password),
+            role="instructor",
+            is_admin=False
+        )
+    db.add(new_user)
+    db.flush()
     instructor=Instructor(
         name=instructor_data.name,
         email=instructor_data.email,
         specialization=instructor_data.specialization,
         experience_years=instructor_data.experience_years,
-        price_per_month=instructor_data.price_per_month
+        price_per_month=instructor_data.price_per_month,
+        is_available=instructor_data.is_available,
+        user_id=new_user.id
+
     )
-    db.add(instructor)
-    db.commit()
+    try:
+        db.add(new_user)
+        db.flush()
+        instructor.user_id=new_user.id
+        db.add(instructor)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise
+
     return instructor
 
 @app.get("/instructors",response_model=list[InstructorResponse])
@@ -568,7 +625,7 @@ def update_instructor(
             status_code=404,
             detail="instructor not found"
         )
-        instructor.name = instructor_data.name
+    instructor.name = instructor_data.name
     instructor.email = instructor_data.email
     instructor.specialization = instructor_data.specialization
     instructor.experience_years = instructor_data.experience_years
@@ -606,9 +663,9 @@ def choose_instructor(
     if not instructor:
         raise HTTPException(
             status_code=404,
-            details="Instructor not found or unavailable"
+            detail="Instructor not found or unavailable"
         )
-    current_user.instructor_id==instructor.id
+    current_user.instructor_id=instructor.id
     db.commit()
     return{
         "message":"Instructor selected successfully",
@@ -660,4 +717,176 @@ def remove_my_instructor(
 
     return {
         "message": "Instructor selection removed successfully"
+    }
+
+@app.post("/bookings", response_model=BookingResponse)
+def create_booking(
+    instructor_id: int,
+    start_date: datetime,
+    end_date: datetime,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    instructor = db.query(Instructor).filter(
+        Instructor.id == instructor_id,
+        Instructor.is_available == True
+    ).first()
+
+    if not instructor:
+        raise HTTPException(
+            status_code=404,
+            detail="Instructor not found or unavailable"
+        )
+
+    if start_date >= end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid booking dates"
+        )
+
+    if start_date < datetime.now():
+        raise HTTPException(
+            status_code=400,
+            detail="Booking start date cannot be in the past"
+        )
+
+    total_days = (end_date - start_date).days
+    duration_months = math.ceil(total_days / 30)
+
+    total_price = duration_months * instructor.price_per_month
+
+    new_booking = Booking(
+        user_id=current_user.id,
+        instructor_id=instructor_id,
+        start_date=start_date,
+        end_date=end_date,
+        total_price=total_price,
+        status="pending"
+    )
+
+    try:
+        db.add(new_booking)
+        db.commit()
+        db.refresh(new_booking)
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Booking creation failed"
+        )
+
+    return new_booking
+
+@app.get("/bookings",response_model=list[BookingResponse])
+def get_bookings(db:Session=Depends(get_db),current_user:User=Depends(get_current_user)):
+    bookings=db.query(Booking).filter(Booking.user_id==current_user.id).all()
+    if not bookings:
+        raise HTTPException(
+            status_code=404,
+            detail="no bookings found"
+        )
+    return bookings
+
+@app.delete("/bookings/{booking_id}")
+def cancel_booking(booking_id:int,db:Session=Depends(get_db),current_user:User=Depends(get_current_user)):
+    booking=db.query(Booking).filter(Booking.id==booking_id,Booking.user_id==current_user.id).first()
+    if not booking:
+        raise HTTPException(
+            status_code=404,
+            detail="booking not found"
+        )
+    if booking.status!="pending":
+        raise HTTPException(
+            status_code=400,
+            detail="only pending bookings can be canceled"
+        )
+   
+    db.delete(booking)
+    db.commit()
+    return{
+        "message":"booking canceled successfully"
+    }
+
+@app.post("/payments/create_order/{booking_id}")
+def create_payment_order(booking_id:int,db:Session=Depends(get_db),current_user:User=Depends(get_current_user)):
+    if current_user.instructor_id is None:
+        raise HTTPException(status_code=400,detail="you have not selected an instructor")
+    instructor=db.query(Instructor).filter(Instructor.id==current_user.instructor_id).first()
+    if not instructor:
+        raise HTTPException(status_code=404,detail="instructor not found")
+    booking=db.query(Booking).filter(Booking.id==booking_id,Booking.user_id==current_user.id).first()
+    if not booking:
+        raise HTTPException(status_code=404,detail="booking not found")
+    payment = db.query(Payment).filter(
+    Payment.booking_id == booking.id,
+    Payment.status == "success"
+).first()
+    if payment:
+        raise HTTPException(status_code=400,detail="payment order already exists for this booking")
+    amount=int(round(booking.total_price*100))
+    order_data={
+        "amount":amount,
+        "currency":"INR",
+        "receipt":f"booking_{booking.id}"
+    }
+    order=Client.order.create(data=order_data)
+    new_payment=Payment(
+        booking_id=booking.id,
+        razorpay_order_id=order["id"],
+        amount=order["amount"],
+        status="created",
+        currency="INR"
+    )
+    db.add(new_payment)
+    db.commit()
+    return {
+        "order_id":order["id"],
+        "amount":order["amount"],
+        "currency":order["currency"],
+        "key_id":RAZOR_APIKEY
+    }
+
+@app.post("/payments/verify")
+def verify_payment(data:PaymentVerification,db:Session=Depends(get_db),current_user:User=Depends(get_current_user)):
+    payment=db.query(Payment).filter(Payment.razorpay_order_id==data.razorpay_order_id).first()
+    if not payment:
+        raise HTTPException(status_code=404,detail="payment order not found")
+    booking=db.query(Booking).filter(Booking.id==payment.booking_id,Booking.user_id==current_user.id).first()
+    if not booking or booking.user_id!=current_user.id:
+        raise HTTPException(status_code=403,detail="not authorized")
+    try:
+        Client.utility.verify_payment_signature({
+            "razorpay_order_id":data.razorpay_order_id,
+            "razorpay_payment_id":data.razorpay_payment_id,
+            "razorpay_signature":data.razorpay_signature
+        })
+    except razorpay.errors.SignatureVerificationError:
+        raise HTTPException(status_code=400,detail="payment signature verification failed")
+    payment.razorpay_payment_id=data.razorpay_payment_id
+    payment.razorpay_signature=data.razorpay_signature
+    payment.status="success"
+    booking.status="confirmed"
+    db.commit()
+    return{"message":"payment verified",
+           "booking_status":booking.status,
+           "payment_status":payment.status}
+           
+
+@app.get("/payments/{payment_id}")
+def get_payment_status(payment_id:int,db:Session=Depends(get_db),current_user:User=Depends(get_current_user)):
+    payment=db.query(Payment).filter(Payment.id==payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404,detail="payment not found")
+    booking=db.query(Booking).filter(Booking.id==payment.booking_id).first()
+    if not booking or booking.user_id!=current_user.id:
+        raise HTTPException(status_code=403,detail="not authorized")
+    return {
+        "payment_id": payment.id,
+        "booking_id": payment.booking_id,
+        "amount": payment.amount / 100,
+        "currency": payment.currency,
+        "payment_status": payment.status,
+        "razorpay_order_id": payment.razorpay_order_id,
+        "razorpay_payment_id": payment.razorpay_payment_id
     }

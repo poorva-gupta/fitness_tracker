@@ -1,4 +1,4 @@
-from langchain_community.vectorestores import FAISS
+from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI

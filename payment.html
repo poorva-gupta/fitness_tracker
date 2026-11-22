@@ -1,0 +1,110 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Fitness Tracker Payment</title>
+</head>
+<body>
+
+    <h2>Fitness Tracker - Payment</h2>
+
+    <label>Booking ID:</label>
+    <input type="number" id="booking_id" placeholder="Enter Booking ID">
+
+    <br><br>
+
+    <label>JWT Token:</label>
+    <input type="text" id="token" placeholder="Paste your token">
+
+    <br><br>
+
+    <button onclick="payNow()">Pay Now</button>
+
+    <p id="result"></p>
+
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+
+    <script>
+        async function payNow() {
+
+            const bookingId = document.getElementById("booking_id").value;
+            const token = document.getElementById("token").value;
+
+            // Step 1: Create Razorpay order
+            const response = await fetch(
+                `/payments/create_order/${bookingId}`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+
+            const order = await response.json();
+
+            if (!response.ok) {
+                document.getElementById("result").innerText =
+                    order.detail || "Order creation failed";
+                return;
+            }
+
+            // Step 2: Open Razorpay Checkout
+            const options = {
+                key: order.key_id,
+                amount: order.amount,
+                currency: order.currency,
+                name: "Fitness Tracker",
+                description: "Instructor Booking Payment",
+                order_id: order.order_id,
+
+                handler: async function (paymentResponse) {
+
+                    // Step 3: Verify payment
+                    const verifyResponse = await fetch(
+                        "/payments/verify",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Authorization": "Bearer " + token,
+                                "Content-Type": "application/json"
+                            },
+                            body: JSON.stringify({
+                                razorpay_order_id:
+                                    paymentResponse.razorpay_order_id,
+
+                                razorpay_payment_id:
+                                    paymentResponse.razorpay_payment_id,
+
+                                razorpay_signature:
+                                    paymentResponse.razorpay_signature
+                            })
+                        }
+                    );
+
+                    const result = await verifyResponse.json();
+
+                    document.getElementById("result").innerText =
+                        result.message || result.detail;
+                },
+
+                theme: {
+                    color: "#3399cc"
+                }
+            };
+
+            const checkout = new Razorpay(options);
+
+            checkout.on("payment.failed", function (response) {
+                document.getElementById("result").innerText =
+                    "Payment Failed: " +
+                    response.error.description;
+            });
+
+            checkout.open();
+        }
+    </script>
+
+</body>
+</html>
